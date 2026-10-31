@@ -1,0 +1,432 @@
+# Roteiro de pesquisa: visão computacional em tempo real em Go
+
+Oct 27, 2026 · @natasha
+
+Este roteiro leva de uma tese testável a um paper-mãe completo, feito em módulos que se cortam em versões de tamanhos diferentes, com marcos de 27/out/2026 a 31/mai/2027.
+
+## 1. Tese, perguntas de pesquisa e contribuições
+
+**Tese.** Com o SIMD nativo do Go (experimental desde o Go 1.26 em amd64; portátil e com arm64 NEON e wasm no Go 1.27), um pipeline de visão em tempo real em Go puro pode ficar competitivo com bindings cgo para OpenCV, libjpeg-turbo e ONNX Runtime em CPU e edge. O ganho esperado vem de menos fronteiras cgo, menos pressão sobre o GC e deploy mais simples. O estudo mede onde essa tese vale e onde não vale.
+
+**Escopo.** Inferência e pré-processamento em CPU, mais WASM. GPU entra só como experimento secundário, porque em Go ela depende de bibliotecas C (CUDA, TensorRT ou XLA). Treino fica fora.
+
+### Perguntas de pesquisa
+
+| RQ | Pergunta | Hipótese (a refutar) | Módulo |
+| --- | --- | --- | --- |
+| RQ1 | Quanto o SIMD nativo do Go acelera os kernels de pré-processamento (decode JPEG, resize, conversão de cor, normalização, NMS) frente ao Go escalar e a cgo (libjpeg-turbo, libvips, OpenCV)? | Go com SIMD chega a ao menos 70% do throughput de cgo na maioria dos kernels e supera cgo em kernels pequenos, onde a chamada domina. | CORE |
+| RQ2 | Qual o custo de latência e throughput de cada backend de inferência acessível a Go (onnxruntime\_go, GoCV dnn, onnx-gomlx, caminho em Go puro) frente a Python? | O overhead de cgo é pequeno para modelos grandes e dominante para modelos pequenos. | EXTENDED |
+| RQ3 | Como desenhos de pipeline com goroutines (sequencial, estágios com canais limitados, pool de workers) afetam FPS sustentado e latência de cauda (p99) em x86 e ARM? | Estágios com canais limitados e descarte de quadros reduzem o p99 sem perder FPS médio. | CORE |
+| RQ4 | Como GC e ciclo de vida de memória (GOGC, GOMEMLIMIT, reuso de buffers, `Mat.Close()` no GoCV) afetam a latência de cauda? | Reuso de buffers reduz o p99 mais que ajuste de GOGC. | EXTENDED |
+
+### Contribuições esperadas
+
+1. Uma suíte de microbenchmarks reprodutível para visão em Go, com implementação escalar, SIMD e cgo de cada kernel.
+2. A primeira avaliação sistemática, que eu saiba, de SIMD nativo do Go em kernels de visão. Antes de afirmar ineditismo, confirme com a busca da Fase 1: o levantamento que fizemos não cobriu Scholar, ACM nem IEEE.
+3. Uma caracterização de pipelines de visão em Go (latência de cauda, GC, cgo) em x86 e ARM.
+4. Um guia de decisão: quando usar Go puro e quando manter cgo.
+
+**Módulos:** CORE entra em qualquer versão; EXTENDED entra nas versões longas (versões média e completa); OPTIONAL só se sobrar tempo.
+
+## 2. Paper-mãe: estrutura e versões por tamanho
+
+O paper-mãe tem 13 seções, cerca de 20 páginas em duas colunas, e cada seção leva uma etiqueta de módulo: cortar é tirar etiquetas, não reescrever.
+
+| Seção | Conteúdo | Módulo | Páginas (versão completa) |
+| --- | --- | --- | --- |
+| Resumo | Problema, método, 3 números-chave, achado principal | CORE | 0,2 |
+| 1. Introdução | Motivação (cgo, GC, deploy), lacuna, RQs, contribuições | CORE | 1,5 |
+| 2. Contexto | SIMD no Go 1.26/1.27, cgo, modelo de GC, pipeline de visão | CORE | 1,5 |
+| 3. Trabalhos relacionados | Frameworks de ML em Go, bibliotecas de imagem em Go, cgo e GC, SIMD, visão em edge, Rust/Julia/Swift | CORE | 1,5 |
+| 4. Metodologia | Hardware, software, protocolo de medição, plano estatístico | CORE | 2,0 |
+| 5. Projeto e implementação | Kernels (escalar, SIMD, cgo), pipeline, backends | CORE | 2,0 |
+| 6. Resultados RQ1 | Kernels de pré-processamento | CORE | 3,0 |
+| 7. Resultados RQ2 | Backends de inferência | EXTENDED | 2,0 |
+| 8. Resultados RQ3 | Pipeline fim a fim, latência de cauda | CORE | 3,0 |
+| 9. Resultados RQ4 | GC e ciclo de vida de memória | EXTENDED | 1,5 |
+| 10. Discussão | Guia de decisão: Go puro vs cgo | CORE | 1,0 |
+| 11. Ameaças à validade | Interna, externa, de construto, de conclusão | CORE | 0,7 |
+| 12. Conclusão e trabalhos futuros | Resposta às RQs e limites | CORE | 0,4 |
+
+### Versões por tamanho
+
+| Versão | Tamanho de referência | Módulos | Como obter |
+| --- | --- | --- | --- |
+| Curta | cerca de 6 páginas | Uma só RQ (RQ1 ou RQ3), método essencial, uma figura principal e a ameaça mais séria | Desligar EXTENDED e OPTIONAL, manter uma só RQ e mover o resto para o repositório |
+| Média | cerca de 10 páginas | CORE inteiro, com RQ1 e RQ3 | Desligar EXTENDED e OPTIONAL |
+| Longa | cerca de 14 páginas | CORE mais a RQ2 | Ligar o módulo da RQ2 |
+| Completa | cerca de 20 páginas | Todos os módulos | Ligar EXTENDED e OPTIONAL |
+
+**Regra de corte:** a versão curta mantém a pergunta, o método, o resultado principal e a ameaça mais séria de cada módulo; figuras secundárias vão para o apêndice ou para o repositório.
+
+**Regra de sobreposição:** um mesmo resultado não aparece em dois textos ao mesmo tempo. Cada versão curta recebe um recorte diferente (por exemplo, uma RQ por versão), e a versão completa estende de forma substancial o que já saiu.
+
+## 3. Fase 0: protocolo e preparação (semana de 27/out a 2/nov)
+
+A fase termina quando o protocolo está congelado em um arquivo versionado e um comando sobe o ambiente de medição em qualquer máquina.
+
+- [ ] Escrever `PROTOCOL.md` com as RQs, hipóteses, métricas, tamanho de amostra e plano estatístico, e fazer commit antes de qualquer medição (pré-registro leve).
+- [ ] Fechar o inventário de hardware: um x86 com AVX2 (e AVX-512, se houver), um ARM de edge só com CPU (por exemplo Raspberry Pi 5 ou Jetson), e opcionalmente Apple Silicon. Registrar CPU, RAM, SO, kernel, governor e refrigeração.
+- [ ] Confirmar a versão do Go: se o 1.27 já saiu como estável (vi apenas o rc3 de agosto de 2026) e quais APIs do `simd` e do `archsimd` existem, lembrando que `ReduceSum` ficou para a versão seguinte.
+- [ ] Fixar versões: GoCV 0.42 com OpenCV 4.12, libjpeg-turbo, libvips, ONNX Runtime e o par `onnxruntime_go`. Usar `go.mod` e um Dockerfile com hashes.
+- [ ] Criar o repositório com licença aberta e CI que roda testes de correção (sem benchmarks) em amd64 e arm64.
+- [ ] Preparar uma cópia anônima do repositório (sem nomes nem URLs que identifiquem os autores), para o caso de o texto precisar de revisão cega, e citar trabalho próprio em terceira pessoa.
+- [ ] Registrar o uso de ferramentas de IA na escrita, no código, nos dados, nas figuras e nas citações, e conferir à mão cada número e cada referência.
+- [ ] Combinar papéis de autoria (quem implementa, quem mede, quem escreve) e abrir um registro de decisões datado.
+- [ ] Escrever o guia de controle de ruído: frequência fixa, núcleos isolados (`taskset`), máquina ociosa, temperatura monitorada em ARM, `GOMAXPROCS` explícito.
+
+**Critério de pronto:** `make smoke` roda um benchmark mínimo em todas as máquinas e grava os metadados do ambiente.
+
+## 4. Fase 1: revisão de literatura sistemática (semanas 1 e 2, em paralelo à Fase 3)
+
+A fase entrega uma base de pelo menos 40 trabalhos classificados e uma declaração de lacuna sustentada por buscas documentadas, para que o ineditismo não dependa da minha busca web, que não cobriu Scholar, ACM nem IEEE.
+
+### Bases e protocolo
+
+Google Scholar, ACM Digital Library, IEEE Xplore, arXiv, dblp e Semantic Scholar. Registrar, para cada busca, a string, a data, a base e o número de resultados. Fazer snowballing para trás e para frente a partir das âncoras abaixo. Incluir também o blog oficial do Go sobre SIMD e as propostas e issues do repositório do Go, marcados como literatura cinzenta.
+
+### Strings de busca (adaptar a sintaxe de cada base)
+
+1. ("Go" OR "Golang") AND ("machine learning" OR "deep learning" OR "neural network") AND (framework OR library)
+2. ("Go" OR "Golang") AND (cgo OR "foreign function interface") AND (overhead OR performance)
+3. ("Go" OR "Golang") AND ("garbage collector" OR "garbage collection") AND (latency OR "tail latency")
+4. (SIMD OR vectorization) AND ("Go language" OR Golang)
+5. ("image processing" OR "computer vision") AND (Golang OR "Go language")
+6. ("video analytics" OR "vision pipeline") AND edge AND ("tail latency" OR p99)
+7. ("image preprocessing" OR "JPEG decoding" OR resize) AND SIMD AND ("real-time" OR embedded)
+
+### Critérios
+
+- **Inclui:** trabalho revisado por pares, preprint com método descrito, ou documentação técnica oficial; sobre desempenho de Go, bindings, SIMD, ou pipelines de visão em tempo real.
+- **Exclui:** texto sem método ou números reproduzíveis, posts sem dados, e trabalhos sobre VLMs em edge que não tratem da camada de sistema.
+
+### Âncoras já identificadas
+
+- Detecção por comparação de intensidade de pixel (Markuš et al., arXiv 1305.4537), base do Pigo.
+- Go em HPC: NPB em Go, C++, Fortran e Rust (2026); Go em astrofísica computacional (2018).
+- Avaliação do GC do Go com GOGC (monografia da UFC).
+- Frameworks e AD: Zygote, PyTorch 2 (2024), Swift for TensorFlow, Burn.
+- Armadilhas de benchmarking de ML (arXiv 1904.12437) e o EdgeEye, para pipelines de vídeo em edge.
+- Issue do Go sobre `image/jpeg` lento (golang/go #24499) e o blog oficial de SIMD do Go.
+- Projetos: GoMLX, go-xla, onnx-gomlx, Gorgonia, Spago, Gotch, GoCV, Pigo, Ollama.
+
+### Matriz de extração (uma linha por trabalho)
+
+Referência, ano, tipo, linguagem, domínio, hardware, métrica, resultado principal, limitação, e a RQ a que serve.
+
+### Declaração da lacuna (modelo de três frases)
+
+"Bindings cgo dominam a visão computacional em Go, mas seu custo de fronteira e de memória não foi caracterizado de forma sistemática. O SIMD nativo do Go (1.26 e 1.27) permite, pela primeira vez, kernels de visão sem cgo, e não há avaliação disso. Este trabalho mede onde Go puro compete com cgo e onde não compete." Só vale se as buscas confirmarem.
+
+**Entregáveis:** a planilha de extração, `related-work.md` organizado em seis grupos (frameworks de ML em Go, bibliotecas de imagem em Go, cgo e GC, SIMD, visão em edge, linguagens alternativas) e o arquivo BibTeX.
+
+**Critério de pronto:** pelo menos 40 itens classificados e as sete buscas registradas com data e contagem.
+
+## 5. Fase 2: desenho experimental (semana 2)
+
+Cada RQ tem seu conjunto de variantes, métricas e critério de correção, definidos antes de medir; os valores numéricos abaixo são propostas de projeto, a ajustar no `PROTOCOL.md`.
+
+### 5.1 RQ1: kernels de pré-processamento
+
+| Kernel | Variantes comparadas | Entradas | Verificação de correção |
+| --- | --- | --- | --- |
+| Decode JPEG (IDCT, upsampling, YCbCr para RGB) | `image/jpeg` da stdlib; Go com SIMD; cgo com libjpeg-turbo; GoCV `IMDecode` | JPEG 4:2:0 e 4:4:4 em 640×480, 1280×720 e 1920×1080 | Diferença máxima por pixel e PSNR contra libjpeg-turbo |
+| Resize (bilinear e por área) | `x/image/draw`; Go com SIMD; libvips (bimg ou govips); GoCV `Resize` | 1080p para 640 e 720p para 416 | Diferença máxima e PSNR contra OpenCV |
+| Conversão de cor (YUYV/NV12 e RGB/BGR) | Go escalar; Go com SIMD; GoCV `CvtColor` | Quadros no formato de saída da câmera V4L2 | Igualdade exata (aritmética inteira) |
+| Normalização, HWC para CHW e float32 | Escalar; SIMD; C de referência | Tensores 3×640×640 | Tolerância absoluta de 1e-6 |
+| Letterbox e padding | Escalar; SIMD | Proporções variadas | Igualdade exata |
+| NMS (pós-processamento) | Escalar; SIMD no cálculo de IoU; GoCV `NMSBoxes` | De 1 mil a 10 mil caixas | Mesmo conjunto de caixas mantidas |
+
+Como teto, uma versão em C compilada com `-O3` para AVX2 ou NEON, chamada via cgo.
+
+**Métricas:** imagens por segundo e MB/s; latência por chamada (p50 e p95); ciclos por byte e IPC com `perf stat` (x86, e ARM quando o PMU permitir); escalabilidade com 1, 2, 4 e 8 threads; custo isolado de uma chamada cgo vazia; energia por imagem (RAPL em x86); `B/op` e `allocs/op`.
+
+### 5.2 RQ2: backends de inferência
+
+| Backend | Como Go o usa | Observação |
+| --- | --- | --- |
+| ONNX Runtime | `onnxruntime_go` (cgo) | Exige casar a versão do binding com a do runtime |
+| OpenCV DNN | GoCV `dnn` (cgo) | Lê ONNX; CPU e, se compilado, CUDA |
+| GoMLX com XLA | `onnx-gomlx` (XLA/PJRT, CPU) | Evita o ONNX Runtime, mas embute XLA |
+| GoMLX em Go puro | `onnx-gomlx` com o backend `simplego` | Cobertura de operadores limitada; verificar se o modelo roda |
+| Go puro do projeto | CNN pequena em int8 com SIMD | OPTIONAL: protótipo para o limite inferior de dependências |
+| Python (referência) | ONNX Runtime e OpenCV em Python | Só como régua externa |
+
+**Modelos:** um classificador (MobileNetV3 ou ResNet-50), um detector (YOLO nano ou small) e, opcionalmente, um transformer visual pequeno.
+
+**Paridade antes de medir:** top-1 em um subconjunto do ImageNet (1 mil imagens) e mAP em um subconjunto do COCO (500 imagens), com concordância de top-1 entre backends de pelo menos 99,5% (critério proposto). Backend que diverge fica fora da comparação de desempenho, e o motivo é registrado.
+
+### 5.3 RQ3: pipeline fim a fim
+
+Estágios: captura, decode, pré-processamento, inferência, pós-processamento, saída.
+
+| Desenho | Descrição |
+| --- | --- |
+| A. Sequencial | Um laço por quadro; linha de base |
+| B. Estágios com canais limitados | Uma goroutine por estágio, canais de capacidade 1 ou 2, descarte do quadro mais antigo quando cheio |
+| C. Pool de workers | N workers com reordenação na saída |
+| D. Batching dinâmico | OPTIONAL: agrupa quadros até um prazo |
+
+**Carga:** um vídeo gravado em 1080p repetido em laço, para reprodutibilidade, a 15, 30 e 60 quadros por segundo, com 30 s de aquecimento e 5 min de medição; uma sessão com câmera USB ao vivo, só para validar. **Medição:** timestamp monotônico por quadro em cada estágio, para decompor a latência.
+
+**Métricas:** FPS sustentado; latência fim a fim em p50, p95, p99 e p99,9; jitter; quadros descartados; CPU e RSS; pausas de GC (`runtime/metrics` e `GODEBUG=gctrace=1`); taxa de alocação; número de chamadas cgo por quadro.
+
+### 5.4 RQ4: GC e ciclo de vida de memória
+
+- `GOGC` em 50, 100 e 200, e desligado com `GOMEMLIMIT` fixo.
+- Alocação ingênua por quadro contra buffers reutilizados (`sync.Pool` e buffer fixo por estágio).
+- GoCV: disciplina de `Mat.Close()` contra vazamento deliberado, para medir o custo; usar o profiler de `Mat` (build tag `matprofile`) para achar vazamentos.
+- Métricas: p99 de latência, RSS, tempo total de pausa de GC e taxa de alocação.
+
+### 5.5 Hardware e execução
+
+x86 com AVX2 (e AVX-512 se houver), ARM de edge com NEON, e opcionalmente Apple Silicon. GPU fica fora do escopo principal; se sobrar tempo, um experimento OPTIONAL com ONNX Runtime e CUDA quantifica o caminho de GPU, que depende de cgo.
+
+### 5.6 Plano estatístico
+
+- Pelo menos 30 execuções por configuração de microbenchmark, em processos separados, e 5 execuções longas por configuração de pipeline.
+- Ordem das configurações embaralhada (interleaving), para não confundir resultado com deriva térmica.
+- Medianas e intervalo interquartil; intervalos de confiança de 95% por bootstrap.
+- Comparação entre pares com Mann-Whitney, tamanho de efeito de Cliff e correção de Holm para comparações múltiplas.
+- Speedups reportados como razão, com intervalo de confiança; `benchstat` para os benchmarks do Go.
+- Aquecimento e estado estacionário definidos no protocolo, com verificação de tendência.
+- Outliers reportados, nunca descartados em silêncio.
+
+### 5.7 Ameaças a registrar desde já
+
+| Tipo | Ameaça | Mitigação |
+| --- | --- | --- |
+| Interna | Ruído do SO, deriva térmica, ordem das execuções | Isolamento de núcleos, frequência fixa, interleaving |
+| Externa | Poucas CPUs e poucos modelos | Declarar o alcance; incluir ao menos dois x86 e um ARM |
+| De construto | Vídeo em laço pode ser mais fácil que cenas reais | Validar com a sessão ao vivo e com um segundo vídeo |
+| De conclusão | Amostra pequena | Tamanho de amostra no protocolo e intervalos de confiança |
+| De versão | API de SIMD do Go é experimental e muda | Fixar a versão do Go e repetir na versão seguinte |
+
+## 6. Fase 3: implementação do harness (semanas 2 a 5)
+
+O código sai em sete marcos, dos kernels simples aos mais difíceis, e cada kernel só entra na coleta depois de passar no teste diferencial contra a referência escalar.
+
+### Estrutura do repositório
+
+```text
+govision-bench/
+  PROTOCOL.md
+  cmd/                bench-kernels, bench-pipeline, validate
+  kernels/
+    decode/           scalar, simd, cgo_turbojpeg, gocv
+    resize/  color/  normalize/  letterbox/  nms/
+  backends/           ort, gocvdnn, gomlx_xla, gomlx_go, purego
+  pipeline/           sequential, staged, pool
+  internal/           timing, metrics, envinfo
+  testdata/           checksums (os datasets são baixados por script)
+  scripts/            run_matrix.sh, collect_env.sh, analyze/
+  docker/             imagens com versões fixas
+  paper/              fonte LaTeX do paper-mãe
+  results/            CSV bruto com metadados
+```
+
+### Marcos de implementação
+
+1. `internal/envinfo`, `internal/timing` e `make smoke`.
+2. Kernels de alto retorno e baixo risco: normalização com HWC para CHW, conversão de cor e letterbox, com SIMD.
+3. Resize bilinear e por área.
+4. NMS, com IoU vetorizado.
+5. Decode JPEG: acelerar IDCT e a conversão YCbCr para RGB. É o item mais difícil; se não fechar a tempo, o plano B é acelerar só essas duas etapas sobre o decoder da stdlib e declarar o limite.
+6. Interface comum `Backend` (`Load`, `Run`) e os adaptadores de ONNX Runtime, GoCV dnn e GoMLX.
+7. Os desenhos de pipeline A, B e C com instrumentação por estágio.
+
+### Regras de engenharia
+
+- **Referência canônica:** cada kernel tem uma versão escalar simples, tratada como verdade.
+- **Versão SIMD com fallback:** o pacote `simd` do Go 1.27 emula as operações quando não há hardware, então o código roda em qualquer máquina; manter também a variante `archsimd` para amd64 se a API portátil ficar atrás em desempenho, com build tags por arquitetura.
+- **Teste diferencial:** entradas aleatórias e casos de borda, em especial larguras que não são múltiplas do vetor (caudas tratadas com `LoadPart` e `StorePart`).
+- **Benchmarks parametrizados:** `b.ReportAllocs()`, `b.SetBytes()` e tamanhos como sub-benchmarks.
+- **Fuzzing** nos decoders, com o fuzzing nativo do Go.
+- **`-race`** nos pipelines; `unsafe` apenas na fronteira cgo, documentado.
+- **CI** com testes de correção em amd64 e arm64; benchmarks rodam só nas máquinas de medição.
+
+### Esquema do CSV de resultados
+
+```text
+timestamp, git_sha, host, cpu_model, isa, go_version, goexperiment,
+gomaxprocs, kernel, impl, input, threads, rep,
+ns_per_op, bytes_per_op, allocs_per_op, throughput_mb_s,
+ipc, cycles_per_byte, energy_j
+```
+
+### Reprodutibilidade
+
+- Dockerfile com versões fixas e hashes; `go.mod` fixado.
+- Alvos do `make`: `smoke`, `test`, `bench-kernels`, `bench-pipeline`, `analyze` e `paper`.
+- Datasets baixados por script, com checksum, a partir das fontes oficiais: não redistribuir ImageNet nem COCO no repositório, por causa dos termos de uso.
+- Licença aberta (Apache-2.0 ou MIT) e, se necessário, uma cópia anônima do repositório para revisão cega.
+
+**Critério de pronto da fase:** os cinco primeiros kernels passam no teste diferencial em amd64 e arm64, e o `bench-kernels` grava o CSV completo.
+
+## 7. Fase 4: coleta de dados (semanas 4 a 6 para RQ1; janeiro a março para RQ2 a RQ4)
+
+A matriz completa soma da ordem de 70 a 75 horas de máquina, repartidas em três máquinas, e roda em ondas para ajustar o tamanho de amostra antes do gasto grande.
+
+| RQ | Fatores e níveis | Repetições | Execuções (máximo) | Tempo estimado |
+| --- | --- | --- | --- | --- |
+| RQ1 | 6 kernels × 4 implementações × 3 tamanhos × 4 níveis de threads × 3 máquinas = 864 configurações | 30 por configuração | 25.920 | cerca de 7 h por máquina, a \~3 s por execução |
+| RQ2 | 3 modelos × 5 backends × 3 níveis de threads × 3 máquinas = 135 configurações | 30, cada uma com 200 inferências após 20 de aquecimento | 4.050 | cerca de 4 h por máquina |
+| RQ3 | 3 desenhos × 3 taxas de entrada × 2 backends × 3 máquinas = 54 configurações | 5 execuções de 5,5 min | 270 | cerca de 8 h por máquina |
+| RQ4 | 4 níveis de GC × 2 estratégias de memória × 2 backends × 2 máquinas = 32 configurações | 5 execuções de 5,5 min | 160 | cerca de 15 h no total |
+
+Nem toda combinação existe (por exemplo, o decode tem mais implementações que a normalização), então os números são tetos. Os tempos são estimativas a recalibrar no piloto.
+
+### Ondas de execução
+
+1. **Onda 1, piloto:** cerca de 10% das configurações, para medir a variância e fixar o número de repetições. Critério proposto: intervalo de confiança de 95% da mediana dentro de ±2% nos kernels.
+2. **Onda 2:** matriz completa da RQ1 nas três máquinas.
+3. **Onda 3:** RQ2, RQ3 e RQ4, nessa ordem.
+
+### Higiene dos dados
+
+- Cada execução grava o ambiente: git SHA, versão do Go, `GOMAXPROCS`, frequência, temperatura e governor.
+- Execuções com *throttling* térmico ou de frequência são invalidadas automaticamente e repetidas.
+- Dados brutos são imutáveis: a análise lê o bruto e nunca o edita; resultados filtrados vivem em outro diretório.
+- Cada versão do paper tem uma tag de git e um snapshot dos resultados, com um depósito com DOI (por exemplo, Zenodo) na versão final.
+- `scripts/run_matrix.sh` é idempotente: pula as configurações já completas, para retomar depois de uma queda.
+
+**Critério de pronto:** matriz da RQ1 completa nas três máquinas, com todas as execuções válidas e o relatório do piloto arquivado.
+
+## 8. Fase 5: análise e figuras-alvo (em paralelo à coleta)
+
+O paper-mãe é desenhado em torno de 11 figuras e 4 tabelas, todas geradas por um único comando a partir dos dados brutos, sem edição manual.
+
+| ID | Conteúdo | RQ | Módulo |
+| --- | --- | --- | --- |
+| F1 | Diagrama do pipeline com as fronteiras cgo marcadas | todas | CORE |
+| F2 | Speedup de SIMD contra escalar e contra cgo, por kernel, com IC de 95% | RQ1 | CORE |
+| F3 | Escalabilidade: throughput contra número de threads, por kernel | RQ1 | CORE |
+| F4 | Custo da chamada cgo contra o tamanho da entrada, com o ponto de cruzamento | RQ1 | CORE |
+| F5 | Ciclos por byte e IPC (x86) | RQ1 | EXTENDED |
+| F6 | Latência por backend e por modelo, com intervalos | RQ2 | EXTENDED |
+| F7 | CDF da latência fim a fim por desenho de pipeline | RQ3 | CORE |
+| F8 | Decomposição empilhada do tempo por estágio | RQ3 | CORE |
+| F9 | Linha do tempo de pausas de GC e latência, em um caso | RQ4 | EXTENDED |
+| F10 | p99 contra `GOGC` e estratégia de memória | RQ4 | EXTENDED |
+| F11 | Pareto de p99, CPU e RSS entre configurações | RQ3 | EXTENDED |
+| T1 | Hardware, versões e flags | todas | CORE |
+| T2 | Dependências e esforço de deploy: bibliotecas nativas, passos de instalação, tamanho do binário, cold start, sucesso do cross-compile para arm64 | RQ2 e RQ3 | CORE |
+| T3 | Resumo de speedups: mediana e intervalo de confiança por kernel e máquina | RQ1 | CORE |
+| T4 | Paridade de acurácia entre backends | RQ2 | EXTENDED |
+
+### Regras de análise
+
+- Congelar o plano estatístico (seção 5.6) antes de abrir os resultados; análise exploratória fica rotulada como tal.
+- Reportar os casos em que cgo vence e os casos sem diferença: eles sustentam o guia de decisão.
+- Checagem de sanidade tipo roofline: nenhum throughput de kernel pode passar da largura de banda de memória medida na máquina.
+- A pergunta central da RQ1 é o ponto de cruzamento: a partir de que tamanho de entrada o custo fixo de uma chamada cgo deixa de importar.
+- Figuras vetoriais (PDF), paleta legível para daltonismo, eixos com unidades, mesma escala entre máquinas quando comparadas.
+- Todo número do texto vem de uma tabela ou figura gerada, nunca digitado à mão.
+
+**Critério de pronto:** `make analyze` regenera todas as figuras e tabelas a partir de `results/`, e o texto das seções de resultado cita apenas números produzidos por ele.
+
+## 9. Fase 6: escrita modular do draft (começa na semana 3, fecha após cada onda de coleta)
+
+O paper é escrito em inglês, numa única fonte LaTeX com módulos ligáveis, começando pelos resultados e terminando pelo título, para que cada versão saia de um comando.
+
+### Fonte única e geração de versões
+
+- `paper/main.tex` inclui um arquivo por seção; macros `\ifmodule{extended}` e `\ifmodule{optional}` ligam e desligam os módulos.
+- Um parâmetro `SIZE` escolhe a versão (curta, média, longa ou completa), o template e o limite de páginas: `make paper SIZE=short`.
+- Uma chave `\anon` esconde autores, agradecimentos e links do repositório, e a macro `\self{}` reescreve citações de trabalho próprio em terceira pessoa, para quando for preciso uma revisão cega.
+- Cada módulo EXTENDED tem uma **mini-versão de um parágrafo**, usada quando a seção é cortada, para que o texto restante continue coerente.
+
+### Ordem de escrita
+
+1. Metodologia e resultados (seções 4 a 9 do paper-mãe), logo depois de cada onda de coleta.
+2. Discussão e ameaças à validade.
+3. Introdução e conclusão.
+4. Trabalhos relacionados, a partir de `related-work.md`.
+5. Resumo, com os números finais.
+6. Título, por último.
+
+### Plano de parágrafos por seção
+
+| Seção | Plano |
+| --- | --- |
+| Introdução (5 parágrafos) | 1) Go domina infraestrutura e a visão em edge exige latência e deploy simples. 2) Os bindings cgo trazem dependências nativas, custo de fronteira e ciclo de vida de memória. 3) O SIMD nativo do Go 1.26 e 1.27 abre uma alternativa. 4) As RQs e a abordagem. 5) Contribuições e organização do texto. |
+| Contexto | SIMD no Go (`archsimd`, `simd`, emulação, build tags); o que é uma chamada cgo e onde está o custo; o modelo de GC do Go, citando o guia oficial; anatomia de um pipeline de visão. |
+| Trabalhos relacionados | Os seis grupos de `related-work.md`, terminando na lacuna declarada. |
+| Metodologia | Hardware e software (T1); protocolo de medição; correção e paridade; plano estatístico; disponibilidade do artefato. |
+| Projeto e implementação | Um parágrafo por kernel, com a decisão de projeto que mais pesou; interface `Backend`; os desenhos A, B e C. |
+| Resultados, uma RQ por seção | 1) O achado com o número. 2) A figura principal. 3) Onde a hipótese falha. 4) A explicação do mecanismo (ciclos por byte, fronteira cgo ou GC). |
+| Discussão | O guia de decisão (T2): quando Go puro, quando cgo; implicações para frameworks de ML em Go; lições de engenharia, como o ciclo de vida do `Mat` e o reuso de buffers. |
+| Ameaças à validade | Interna, externa, de construto e de conclusão, com a mitigação de cada uma. |
+| Conclusão | Resposta explícita a cada RQ em uma frase e os limites do estudo. |
+
+### Revisão interna antes de enxugar
+
+- [ ] Cada RQ tem uma resposta explícita, com número.
+- [ ] Toda afirmação do texto tem um número gerado ou uma citação verificada.
+- [ ] Hipóteses refutadas e resultados nulos aparecem.
+- [ ] Dois leitores externos ao projeto comentaram o texto.
+- [ ] A seção de disponibilidade do artefato existe e o repositório anônimo funciona.
+- [ ] Se ferramentas de IA ajudaram na escrita ou no código, o uso está declarado conforme a política de quem for publicar o texto, e cada número e citação foi conferido à mão.
+
+**Critério de pronto:** o paper-mãe completo compila em todos os modos de `SIZE` e a mini-versão de cada módulo existe.
+
+## 10. Cronograma
+
+O plano fecha a RQ1 até 21 de dezembro e o paper-mãe completo em 31 de maio; as datas são do próprio projeto e se ajustam ao tempo disponível.
+
+&#91;embedded content: cronograma · 9 marcos, de 27 out 2026 a 31 mai 2027\]
+
+Nenhum prazo externo define o ritmo: cada módulo pode ser lapidado antes de decidir onde o texto será publicado.
+
+## 11. Riscos e planos B
+
+Os riscos principais são a API experimental de SIMD do Go e o decode JPEG; os demais têm sinal de alerta e plano B definidos.
+
+| Risco | Sinal de alerta | Plano B |
+| --- | --- | --- |
+| API de SIMD do Go muda ou o pacote portátil não estabiliza | Mudança entre o rc e a versão final; operações como `ReduceSum` ausentes | Fixar a versão, repetir na seguinte e declarar a limitação. |
+| Decode JPEG com SIMD não fecha | O marco 5 atrasa mais de uma semana | Acelerar só a IDCT e a conversão de cor, ou limitar a RQ1 aos outros cinco kernels e deixar o decode como trabalho futuro. |
+| Prazo interno da RQ1 estoura | A coleta da RQ1 não fecha até 7/dez | Reduzir o conjunto de kernels (normalização, conversão de cor, resize e NMS) e recalibrar o cronograma. |
+| Backend em Go puro do GoMLX não cobre os operadores do modelo | Erro de operador não suportado | Trocar de modelo, ou reportar a lacuna de cobertura como resultado. |
+| Sem acesso a hardware ARM | Nenhuma máquina disponível até o fim de novembro | Emulação não serve para medir desempenho; buscar laboratório parceiro ou reduzir o escopo a x86 e declarar. |
+| Resultado negativo (cgo vence em tudo) | O piloto mostra cgo à frente em todos os kernels | Reportar: a tese vira "onde e por que o cgo ainda vence", que é um resultado legítimo. |
+| Outro grupo publica antes | Alertas de arXiv e de Scholar | Diferenciar pela RQ3, pela RQ4 e pelo guia de decisão; monitorar mensalmente. |
+| Ruído de medição alto | Coeficiente de variação alto no piloto | Mais repetições, núcleos isolados, máquina dedicada. |
+| Termos de uso dos datasets | ImageNet e COCO têm termos próprios | Scripts de download, sem redistribuir os dados. |
+| Sobreposição de conteúdo entre versões do texto | O mesmo resultado em dois textos | Dar um recorte diferente a cada versão curta; a completa estende de forma substancial. |
+
+## 12. Decisões pendentes e itens a verificar
+
+Cinco decisões suas destravam o cronograma, e quatro itens ainda precisam de confirmação.
+
+### Decisões suas
+
+- [ ] Hardware disponível: x86 com AVX2 ou AVX-512, e um ARM de edge?
+- [ ] Orientador e coautores, e o papel de cada um?
+- [ ] Quantas horas por semana você tem, para recalibrar o cronograma?
+- [ ] Incluir o experimento de GPU como OPTIONAL?
+- [ ] Idioma do texto: inglês, como assumido?
+
+### A verificar
+
+- [ ] Se o Go 1.27 já saiu como estável e quais APIs de `simd` e `archsimd` ele tem.
+- [ ] Resultado das sete buscas de ineditismo da Fase 1.
+- [ ] Termos de uso do ImageNet e do COCO para o uso previsto.
+- [ ] Licenças de OpenCV, libjpeg-turbo, libvips e ONNX Runtime, e compatibilidade com a licença escolhida para o repositório.
+
+## 13. Fontes
+
+As fontes abaixo sustentam a revisão de literatura e o contexto técnico; confira cada uma na origem antes de citar no texto.
+
+### Fontes técnicas (a conferir na origem)
+
+- [Platform-independent SIMD in Go (Go Blog)](https://go.dev/blog/simd-experiment)
+- [GoCV: versão 0.42 e OpenCV 4.12](https://photog.social/tags/ComputerVision)
+- [Pigo](https://www.GitHub.com/esimov/pigo) e [PICO (Markuš et al.)](https://arxiv.org/pdf/1305.4537.pdf)
+- [NPB em Go (2026)](https://sol.sbc.org.br/index.php/eradrs/article/view/42700)
+- [Avaliação do GC do Go (UFC)](https://repositorio.ufc.br/handle/riufc/81280?locale=en)
+- [Go: image/jpeg lento (issue #24499)](https://golang.org/issue/24499)
+- [Don't Unroll Adjoint (Zygote)](https://arxiv.org/pdf/1810.07951)
+- [PyTorch 2](https://pytorch.org/assets/pytorch2-2.pdf)
+- [Challenges and Pitfalls of ML Evaluation and Benchmarking](https://arxiv.org/pdf/1904.12437)
+- [EdgeEye](https://pages.cs.wisc.edu/~bozhao/papers/edgeeye.pdf)
